@@ -1,22 +1,168 @@
-# IOSurface stays in use after GPU switch
+/**
+ * clang main.m -framework Cocoa -framework QuartzCore -framework IOSurface -o test && ./test
+ **/
 
-This project demonstrates that some IOSurfaces stay in use on macOS 10.15 after a GPU switch even when they are no longer attached to a CALayer or shown on the screen.
+/**
+ * This project demonstrates that some IOSurfaces stay in use on macOS 10.15 after a GPU switch.
+ * This app creates a new IOSurface once a second, and sets it on a CALayer.
+ * Also, once per second, all surfaces are queried through -[IOSurface isInUse].
+ * See the end of this file for example output.
+ **/
 
-This app creates a new IOSurface once a second, and sets it on a CALayer.
-Additionaly, once per second, all surfaces are queried through -[IOSurface isInUse].
-See the end of this file for example output.
+#import <Cocoa/Cocoa.h>
+#import <IOSurface/IOSurfaceObjC.h>
+#import <QuartzCore/QuartzCore.h>
 
-## Running the app
+@interface TestView: NSView
+{
+  BOOL nextTickSetsNewSurface_;
+  int surfaceIndex_;
+  NSMutableArray<IOSurface*>* surfaces_;
+  CALayer* layer_;
+}
 
-Clone the project, and compile and run it as follows:
+@end
 
-```
-git clone https://github.com/mstange/iosurface-calayer-isinuse
-cd iosurface-calayer-isinuse
-clang main.m -framework Cocoa -framework QuartzCore -framework IOSurface -o test && ./test
-```
+@implementation TestView
 
-## Example output
+- (id)initWithFrame:(NSRect)frame
+{
+  self = [super initWithFrame:frame];
+  nextTickSetsNewSurface_ = YES;
+  surfaceIndex_ = 0;
+  surfaces_ = [NSMutableArray new];
+
+  layer_ = [[CALayer layer] retain];
+  layer_.position = NSZeroPoint;
+  layer_.anchorPoint = NSZeroPoint;
+  layer_.bounds = NSMakeRect(0, 0, 300, 300);
+  layer_.contentsGravity = kCAGravityTopLeft;
+  self.wantsLayer = YES;
+  [self.layer addSublayer:layer_];
+  [self performSelector:@selector(tick) withObject:nil afterDelay:0.5];
+
+  return self;
+}
+
+- (void)dealloc {
+  [layer_ release];
+  [surfaces_ release];
+  [super dealloc];
+}
+
+- (void)tick {
+  if (nextTickSetsNewSurface_) {
+    [self setNewSurface];
+  } else {
+    [self dumpSurfaceUsage];
+  }
+  nextTickSetsNewSurface_ = !nextTickSetsNewSurface_;
+  [self performSelector:@selector(tick) withObject:nil afterDelay:0.5];
+}
+
+- (void)setNewSurface {
+  NSLog(@"Creating surface %d", surfaceIndex_);
+
+  IOSurface* newSurf = [[IOSurface alloc] initWithProperties:@{
+    IOSurfacePropertyKeyWidth : @(300),
+    IOSurfacePropertyKeyHeight : @(300),
+    IOSurfacePropertyKeyPixelFormat : @(kCVPixelFormatType_32BGRA),
+    IOSurfacePropertyKeyBytesPerElement : @(4),
+  }];
+  [surfaces_ addObject:newSurf];
+  [self drawToSurface:newSurf drawingHandler:^(NSRect dstRect) {
+    [[NSColor whiteColor] set];
+    NSRectFill(dstRect);
+    [[NSString stringWithFormat:@"%d", surfaceIndex_]
+         drawAtPoint:NSMakePoint(NSMidX(dstRect), NSMidY(dstRect))
+      withAttributes:@{
+          NSFontAttributeName: [NSFont labelFontOfSize:40]
+        }];
+  }];
+
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  layer_.contents = newSurf;
+  layer_.contentsScale = 1;
+  [CATransaction commit];
+
+  [newSurf release];
+
+  surfaceIndex_++;
+}
+
+- (void)dumpSurfaceUsage {
+  NSLog(@"IOSurfaceIsInUse:");
+  [surfaces_ enumerateObjectsUsingBlock:^(IOSurface* surf, NSUInteger idx, BOOL *stop) {
+    NSLog(@"  - IOSurface %@ %@", @(idx), surf.isInUse ? @"is in use" : @"is not in use");
+  }];
+}
+
+- (void)drawToSurface:(IOSurface*)surface drawingHandler:(void (^)(NSRect dstRect))drawingHandler {
+  [surface lockWithOptions:0 seed:nil];
+
+  CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
+  CGContextRef cg = CGBitmapContextCreate(
+      surface.baseAddress, surface.width, surface.height,
+      8, surface.bytesPerRow, rgb,
+      kCGBitmapByteOrder32Host | kCGImageAlphaPremultipliedFirst);
+  CGColorSpaceRelease(rgb);
+  NSGraphicsContext* oldContext = [NSGraphicsContext currentContext];
+  [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithCGContext:cg flipped:NO]];
+
+  drawingHandler(NSMakeRect(0, 0, surface.width, surface.height));
+
+  [NSGraphicsContext setCurrentContext:oldContext];
+  CGContextRelease(cg);
+
+  [surface unlockWithOptions:0 seed:nil];
+}
+
+@end
+
+@interface TerminateOnClose : NSObject<NSWindowDelegate>
+@end
+
+@implementation TerminateOnClose
+- (void)windowWillClose:(NSNotification*)notification
+{
+  [NSApp terminate:self];
+}
+@end
+
+int
+main (int argc, char **argv)
+{
+  NSAutoreleasePool* pool = [[NSAutoreleasePool alloc] init];
+
+  [NSApplication sharedApplication];
+  [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+  int style = 
+    NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+  NSRect contentRect = NSMakeRect(600, 500, 300, 300);
+  NSWindow* window = [[NSWindow alloc] initWithContentRect:contentRect
+                                       styleMask:style
+                                         backing:NSBackingStoreBuffered
+                                           defer:NO];
+
+  NSView* view = [[TestView alloc] initWithFrame:NSMakeRect(0, 0, contentRect.size.width, contentRect.size.height)];
+    
+  [window setContentView:view];
+  [window setDelegate:[[TerminateOnClose alloc] autorelease]];
+  [NSApp activateIgnoringOtherApps:YES];
+  [window makeKeyAndOrderFront:window];
+
+  [NSApp run];
+
+  [pool release];
+  
+  return 0;
+}
+
+/*******************************************************************************
+
+Example output
 
 During this run, I started on the integrated GPU, switched to the discrete GPU
 after surface 2 was created, and switched back to the integrated GPU after
@@ -31,7 +177,6 @@ This was tested on 10.15.2 Beta (19C46a), on a MacBook Pro (15-inch, Late 2016),
 with an Intel HD Graphics 530 and an AMD Radeon Pro 460.
 GPU switching was performed with the help of the gfxCardStatus app from gfx.io.
 
-```
 % clang main.m -framework Cocoa -framework QuartzCore -framework IOSurface -o test && ./test
 2019-11-29 17:11:27.702 test[27952:2001784] Creating surface 0
 2019-11-29 17:11:28.206 test[27952:2001784] IOSurfaceIsInUse:
@@ -121,4 +266,5 @@ GPU switching was performed with the help of the gfxCardStatus app from gfx.io.
 2019-11-29 17:11:38.234 test[27952:2001784]   - IOSurface 8 is not in use
 2019-11-29 17:11:38.234 test[27952:2001784]   - IOSurface 9 is not in use
 2019-11-29 17:11:38.234 test[27952:2001784]   - IOSurface 10 is in use
-```
+
+*******************************************************************************/
